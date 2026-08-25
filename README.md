@@ -1,135 +1,173 @@
-# Fusion 360 on Linux via Wine/Bottles
+# Fusion 360 on Linux (Wine + Bottles)
 
-Get Autodesk Fusion 360 running on Linux using [Bottles](https://usebottles.com/) (Flatpak) and Wine. This guide documents four specific bugs that prevent a working install and their confirmed fixes, along with an automated setup script.
+Getting Fusion 360 to actually run on Linux takes more than just "install Wine and go". There are four distinct failure modes, each with a non-obvious fix. This repo documents all of them and includes a setup script that handles most of the work automatically.
 
-**Tested configuration:**
-- OS: Zorin OS 17 / Ubuntu 24.04 (Wayland session)
-- GPU: Intel Iris Plus Graphics 645 (Coffee Lake, i5-8259U class)
-- RAM: 8 GB
-- Bottles: Flatpak (`com.usebottles.bottles`), latest stable
-- Wine: 11.0 (via Bottles `sys-wine-11.0`)
-- DXVK: 2.7.1
+Works on Ubuntu/Debian and Arch Linux. The script detects your distro, filesystem, and GPU automatically.
+
+**Tested on:**
+- Zorin OS 17 / Ubuntu 24.04 — Intel Iris Plus 645 (Coffee Lake), Wayland, 8 GB RAM
+- Arch Linux — same hardware
 
 ---
 
 ## Quick start
 
 ```bash
-git clone https://github.com/mxioi/fusion360-wine-linux.git
+git clone https://github.com/biplop/fusion360-wine-linux.git
 cd fusion360-wine-linux
 chmod +x setup.sh
 ./setup.sh
 ```
 
-Then follow the manual steps printed at the end (Bottles bottle configuration).
+Follow the manual steps printed at the end to finish configuring the Bottles bottle.
+
+If you want to see what it'll do before running anything with sudo:
+
+```bash
+./setup.sh --dry-run
+```
 
 ---
 
 ## Prerequisites
 
-### 1. Install Bottles
+### Flatpak + Bottles
 
+Bottles needs to be the **Flatpak** version specifically — the OAuth fix (Fix 4) relies on the Flatpak sandbox path. A native install will need the handler script adapted.
+
+**Ubuntu / Debian / Zorin:**
 ```bash
+sudo apt install flatpak
 flatpak install flathub com.usebottles.bottles
 ```
 
-Bottles must be installed as a **Flatpak** — the handler script in Fix 4 depends on the Flatpak sandbox path. A native package install will require adapting the `flatpak run` commands.
+**Arch:**
+```bash
+sudo pacman -S --needed flatpak
+flatpak install flathub com.usebottles.bottles
+```
 
-### 2. Install build tools (for the disk space shim)
+### Build tools
 
+Needed to compile the disk space shim (Fix 1).
+
+**Ubuntu / Debian:**
 ```bash
 sudo apt install build-essential
 ```
 
-### 3. Check Vulkan support
-
+**Arch:**
 ```bash
-sudo apt install vulkan-tools
-vulkaninfo --summary
+sudo pacman -S --needed base-devel
 ```
 
-Your GPU needs a working Vulkan driver. For Intel iGPUs on Ubuntu/Zorin:
+### Vulkan drivers
 
+Run `vulkaninfo --summary` to check. If it errors, install drivers for your GPU:
+
+**Ubuntu / Debian — Intel:**
 ```bash
-sudo apt install intel-media-va-driver libvulkan1 mesa-vulkan-drivers
+sudo apt install vulkan-tools intel-media-va-driver libvulkan1 mesa-vulkan-drivers
 ```
+
+**Arch — Intel:**
+```bash
+sudo pacman -S --needed vulkan-tools vulkan-intel lib32-vulkan-intel vulkan-icd-loader lib32-vulkan-icd-loader
+```
+
+**Arch — AMD:**
+```bash
+sudo pacman -S --needed vulkan-tools vulkan-radeon lib32-vulkan-radeon vulkan-icd-loader lib32-vulkan-icd-loader
+```
+
+**Arch — Nvidia:**
+```bash
+sudo pacman -S --needed vulkan-tools nvidia-utils lib32-nvidia-utils vulkan-icd-loader lib32-vulkan-icd-loader
+```
+
+`setup.sh` auto-detects your GPU and prints the right command if something's missing.
 
 ---
 
 ## Create the Fusion360 bottle
 
-Open Bottles and create a new bottle with these exact settings:
+Open Bottles, create a new bottle, name it exactly `Fusion360`, and use these settings:
 
 | Setting | Value |
 |---|---|
-| Name | `Fusion360` |
 | Environment | Application (custom) |
-| Runner | `sys-wine-11.0` (or latest stable Wine) |
+| Runner | `sys-wine-11.0` (or latest stable) |
 | Windows version | Windows 10 |
 | DXVK | Enabled |
-| Renderer | `gl` — **not** Vulkan |
+| Renderer | `gl` (Intel iGPU) or `vulkan` (AMD/Nvidia) |
 | Virtual Desktop | **Enabled** |
-| Virtual Desktop Resolution | Your screen resolution (e.g. `2560x1600`) |
-| DLL Overrides | **Leave empty** |
+| Virtual Desktop Resolution | Your screen resolution |
+| DLL Overrides | Leave empty |
 
-> **Why virtual desktop?** On Wayland, Wine windows don't integrate cleanly with the compositor unless you wrap them in a virtual desktop (an XWayland window). Without this, Fusion 360 may not receive input or display properly.
+**Virtual Desktop:** On Wayland, Wine doesn't integrate cleanly with the compositor without this. Input and display both break without it.
 
-> **Why `gl` renderer and not `vulkan`?** With Vulkan renderer selected in Bottles, DXVK translates D3D → Vulkan directly but some configurations on XWayland produce rendering artifacts. `gl` uses DXVK's OpenGL fallback path which is more stable on this hardware. DXVK is still active; you're changing the Bottles wrapper layer, not disabling DXVK.
+**Renderer — why `gl` for Intel?** Intel's ANV Vulkan driver (Iris Plus / Coffee Lake) has a bug with `VK_EXT_graphics_pipeline_library` that causes a GPU hang the moment Fusion's 3D viewport renders anything. The `gl` renderer sidesteps this entirely — DXVK is still active, you're just changing which backend it uses. AMD (RADV) and Nvidia don't have this problem and can use `vulkan`.
 
 ---
 
 ## The four fixes
 
-### Fix 1 — Disk space pre-check (`fake_statvfs` shim)
+### Fix 1 — "Not enough disk space"
 
-**Symptom:** Fusion 360 installer or launcher immediately exits with "Not enough disk space" even though you have plenty of space. This happens even when the drive has hundreds of GB free.
+**What happens:** The installer or launcher quits immediately saying there's no disk space, even with hundreds of GB free.
 
-**Root cause:** Fusion 360 checks for at least ~50 GB of free disk space before proceeding. The check goes through Wine's `ntdll.so`, which calls the Linux `fstatfs()` syscall to query disk space — not `statvfs()` as you might expect. Standard Wine workarounds (fake `DISKFREEBYTES` registry keys, drive size settings) operate at a different layer and do not intercept this call.
+**Why:** Fusion 360 requires at least ~50 GB free before it'll proceed. The check goes through Wine's `ntdll.so`, which calls `fstatfs()` directly — not `statvfs()`. The usual Wine workarounds (fake registry keys, drive size settings) don't intercept this call.
 
-**Fix:** Build a small shared library that intercepts `fstatfs()` and `statfs()` via `LD_PRELOAD` and substitutes artificially large block counts. This shim is loaded into the Wine process before any Wine code runs, so the spoofed values reach `ntdll.so`'s disk check.
+**Fix:** An `LD_PRELOAD` shim that intercepts `fstatfs()` and `statfs()` and returns inflated values. It gets loaded before any Wine code, so it catches the check.
 
 ```bash
 gcc -shared -fPIC -o fake_statvfs.so fake_statvfs.c -ldl
 ```
 
-Place the `.so` anywhere on the host filesystem (not inside `drive_c`). The recommended location is alongside your bottle data:
+The `.so` goes anywhere on the host filesystem (not inside `drive_c`). `setup.sh` builds it and puts it here:
 
 ```
 ~/.var/app/com.usebottles.bottles/data/bottles/bottles/fake_statvfs.so
 ```
 
-In Bottles, open your Fusion360 bottle → **Settings** → **Environment Variables** → Add:
+Then in Bottles → Fusion360 → Settings → Environment Variables:
 
 ```
 LD_PRELOAD = /home/YOUR_USERNAME/.var/app/com.usebottles.bottles/data/bottles/bottles/fake_statvfs.so
 ```
 
-The `setup.sh` script compiles and places this file automatically.
-
 ---
 
-### Fix 2 — OOM kill (expand swap)
+### Fix 2 — App dies silently after ~60 seconds
 
-**Symptom:** Fusion 360 appears to load (splash screen, login prompt), but approximately 60–90 seconds after launch the application is killed without warning. No crash dialog appears. Checking `journalctl -b | grep -i oom` or `dmesg | grep -i kill` shows `systemd-oomd` terminated a process.
+**What happens:** Fusion 360 starts fine, login screen appears, then roughly a minute later the whole thing just disappears. No crash dialog. `journalctl -b | grep -i oom` or `dmesg | grep -i kill` will show `systemd-oomd` killed it.
 
-**Root cause:** Fusion 360's "home dashboard" is a Chromium-based web view. Between Wine overhead, the Chromium renderer, and Fusion's geometry kernel, peak RSS easily exceeds 8 GB on a machine with 8 GB of RAM. Linux's `systemd-oomd` monitors memory pressure and kills the most expensive cgroup when the system approaches exhaustion. With no swap space (or small swap), this happens within the first minute of loading.
+**Why:** Fusion's home dashboard runs a Chromium-based web view. Combined with Wine overhead and the geometry kernel, peak memory usage easily clears 8 GB. `systemd-oomd` watches memory pressure and kills the most expensive cgroup when things get tight. Without enough swap headroom, it fires within the first minute.
 
-**Fix:** Expand the system swapfile to 16 GB so there is headroom for memory spikes.
+**Fix:** 16 GB of swap gives enough breathing room.
 
+**Ubuntu / Debian (ext4):**
 ```bash
 sudo swapoff /swapfile
 sudo fallocate -l 16G /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
+echo '/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab
 ```
 
-Verify `/etc/fstab` contains:
-```
-/swapfile swap swap defaults 0 0
+**Arch — btrfs root:**
+
+> Don't use `fallocate` on btrfs — it creates a corrupt swapfile. Use this instead:
+
+```bash
+sudo btrfs subvolume create /swap
+sudo btrfs filesystem mkswapfile --size 16g --uuid clear /swap/swapfile
+sudo swapon /swap/swapfile
+echo '/swap/swapfile none swap defaults 0 0' | sudo tee -a /etc/fstab
 ```
 
-If you don't have a swapfile at all, create one:
+**Arch — ext4 root:**
 ```bash
 sudo fallocate -l 16G /swapfile
 sudo chmod 600 /swapfile
@@ -138,25 +176,19 @@ sudo swapon /swapfile
 echo '/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab
 ```
 
-The `setup.sh` script handles this automatically.
+`setup.sh` detects your filesystem type and picks the right method. It also checks if swap is already large enough (skips if so) and won't try to resize a swap partition.
 
 ---
 
-### Fix 3 — DXVK crash on Intel ANV (`VK_EXT_graphics_pipeline_library`)
+### Fix 3 — Crash when opening a design document
 
-**Symptom:** Fusion 360 loads, login succeeds, the home dashboard appears — but as soon as you open or create a design document, the application crashes or freezes. The Bottles log shows activity stopping at a line containing `CreateNewDocTask END`, often followed by a Vulkan device-lost or GPU hang error.
+**What happens:** Everything works — Fusion loads, you log in, the home dashboard comes up — but the moment you open or create a design, it crashes. The Bottles log cuts off at `CreateNewDocTask END`, usually followed by a GPU hang or device-lost error.
 
-**Root cause:** DXVK 2.x introduced support for `VK_EXT_graphics_pipeline_library`, a Vulkan extension that allows async pipeline compilation (pipelines are built in background threads while rendering proceeds with stubs). This reduces shader compilation stutter significantly.
+**Why:** DXVK 2.x uses `VK_EXT_graphics_pipeline_library` for async pipeline compilation. Intel's ANV driver advertises support for this extension but has a bug that causes a GPU hang when the first complex D3D11 scene renders. Fusion's 3D viewport is the first such scene, so it crashes every time.
 
-Intel's ANV Vulkan driver (used on Iris Plus / UHD 6xx / Coffee Lake iGPUs) advertises support for `VK_EXT_graphics_pipeline_library` but has bugs in that code path that cause a GPU hang when the first complex D3D11 scene is rendered. Fusion 360's 3D viewport is the first such scene, so it reliably crashes on document open.
+Using `d3d11=builtin` (wined3d) doesn't help — on Wayland/XWayland, wined3d renders a completely blank viewport. The app runs but you can't see anything.
 
-**Why not use wined3d instead?** Setting `d3d11=builtin` in DLL overrides disables DXVK and uses Wine's built-in D3D11 implementation (wined3d). On Wayland / XWayland, wined3d produces a completely blank 3D viewport — the application loads and responds to interaction but renders nothing in the design area. This is not a usable workaround.
-
-**Fix:** Create a `dxvk.conf` file that disables the broken extension, placed inside `drive_c`:
-
-```
-~/.var/app/com.usebottles.bottles/data/bottles/bottles/Fusion360/drive_c/dxvk.conf
-```
+**Fix:** A `dxvk.conf` that disables the broken extension:
 
 ```ini
 [dxvk]
@@ -164,72 +196,60 @@ dxvk.enableGraphicsPipelineLibrary = Disabled
 dxvk.enableAsync = False
 ```
 
-Then add to your bottle's environment variables in Bottles:
+Place it inside `drive_c`:
+```
+~/.var/app/com.usebottles.bottles/data/bottles/bottles/Fusion360/drive_c/dxvk.conf
+```
 
+Then in the bottle's environment variables:
 ```
 DXVK_CONFIG_FILE = C:\dxvk.conf
 ```
 
-The `C:\` path is a Windows path inside Wine — `drive_c` maps to `C:\`. The `setup.sh` script copies the file automatically.
+`C:\` is just `drive_c` as seen by Wine. `setup.sh` copies the file automatically.
 
 ---
 
-### Fix 4 — OAuth login (`adskidmgr://` URL scheme)
+### Fix 4 — Login completes in browser but Fusion never signs in
 
-**Symptom:** When you click "Sign In", a browser window opens and you can enter your Autodesk credentials. After submitting, the browser shows a page saying "No apps installed to open this link" or the login flow just hangs, and Fusion 360 never receives the authentication token.
+**What happens:** The Autodesk sign-in browser window opens fine, you enter your credentials, it completes — but Fusion 360 just sits there waiting, never receiving the auth token.
 
-**Root cause:** Autodesk's sign-in uses OAuth 2.0 with a custom URI scheme callback. After the browser-based login completes, Autodesk's server redirects to a URL like `adskidmgr://xxxxxxx`. The browser asks the OS to open this URL with a registered handler, and the OS passes it to `AdskIdentityManager.exe` running inside Wine. On Linux, `adskidmgr://` is not registered as a known URL scheme, so the OS has no handler and the callback is dropped.
+**Why:** Autodesk's OAuth flow redirects the browser to `adskidmgr://...` after login. The browser asks the OS to open that URL with a registered handler, which is supposed to be `AdskIdentityManager.exe` running inside Wine. On Linux, `adskidmgr://` isn't registered as a URL scheme, so the callback just gets dropped.
 
-**Fix:** Register a shell script as the system handler for `x-scheme-handler/adskidmgr`. When the browser triggers the callback URL, the OS invokes the script with the URL as an argument. The script uses `flatpak run --command=/app/bin/wine` to pass the URL to `AdskIdentityManager.exe` inside the bottle.
+**Fix:** Register a shell script as the handler for `x-scheme-handler/adskidmgr`. When the browser fires the callback, the OS calls the script with the URL as an argument, and the script passes it to `AdskIdentityManager.exe` via `flatpak run --command=/app/bin/wine`.
 
-The `--command=/app/bin/wine` form is critical. Using plain `flatpak run com.usebottles.bottles` would start a new Bottles session with its own isolated wineserver, which cannot communicate with the Fusion 360 process already running. The `--command` form invokes Wine directly and shares the existing wineserver via the socket at `/run/user/1000/.flatpak/com.usebottles.bottles/tmp/`.
+The `--command` form is important. Running `flatpak run com.usebottles.bottles` directly starts a new Bottles session with its own isolated wineserver — that new instance can't talk to the Fusion 360 process that's already running. `--command=/app/bin/wine` invokes Wine directly and shares the existing wineserver at `/run/user/1000/.flatpak/com.usebottles.bottles/tmp/`.
 
-`AdskIdentityManager.exe` lives at a path that includes a hex hash that changes between Autodesk update cycles:
-
+`AdskIdentityManager.exe` is buried under a hash that changes with Autodesk updates:
 ```
 C:\users\USERNAME\AppData\Local\Autodesk\webdeploy\production\<HASH>\Autodesk Identity Manager\AdskIdentityManager.exe
 ```
 
-The `adskidmgr-handler.sh` script auto-detects this hash at runtime using `find`, so it survives updates.
+The handler script auto-detects this at runtime with `find`, so it keeps working after updates.
 
-**Installation:**
-
+`setup.sh` installs everything automatically:
 ```bash
-# The setup.sh script does all of this automatically:
-
 cp adskidmgr-handler.sh ~/adskidmgr-handler.sh
 chmod +x ~/adskidmgr-handler.sh
-
-mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/adskidmgr.desktop <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Autodesk Identity Manager
-Exec=/home/YOUR_USERNAME/adskidmgr-handler.sh %u
-MimeType=x-scheme-handler/adskidmgr;
-NoDisplay=true
-Terminal=false
-EOF
-
-xdg-mime default adskidmgr.desktop x-scheme-handler/adskidmgr
-update-desktop-database ~/.local/share/applications
+# creates ~/.local/share/applications/adskidmgr.desktop
+# runs xdg-mime default adskidmgr.desktop x-scheme-handler/adskidmgr
 ```
 
 ---
 
-## Bottle configuration reference (`bottle.yml` key fields)
+## bottle.yml reference
 
-After applying all fixes, your bottle's relevant configuration should look like:
+What the relevant parts of your bottle config should look like after all fixes:
 
 ```yaml
 Runner: sys-wine-11.0
-DXVK: dxvk-2.7.1-19-b0bb947   # or latest available
+DXVK: dxvk-2.7.1-19-b0bb947
 Parameters:
     dxvk: true
     renderer: gl
     virtual_desktop: true
-    virtual_desktop_res: 2560x1600   # match your display resolution
-DLL_Overrides: {}                    # leave empty — no d3d11/dxgi overrides
+    virtual_desktop_res: 2560x1600
+DLL_Overrides: {}
 Environment_Variables:
     DXVK_CONFIG_FILE: 'C:\dxvk.conf'
     LD_PRELOAD: /home/YOUR_USERNAME/.var/app/com.usebottles.bottles/data/bottles/bottles/fake_statvfs.so
@@ -238,20 +258,18 @@ Windows: win10
 
 ---
 
-## Installation steps (full walkthrough)
+## Full installation walkthrough
 
-1. **Install prerequisites** — Bottles Flatpak, `build-essential`, Vulkan drivers (see Prerequisites above)
-2. **Run `setup.sh`** — compiles fake_statvfs.so, expands swap, creates dxvk.conf, registers URL handler
-3. **Create the Fusion360 bottle** in Bottles with the settings in the table above
-4. **Set environment variables** in Bottles (Fusion360 bottle → Settings → Environment Variables):
-   - `LD_PRELOAD` → path to `fake_statvfs.so` (printed by setup.sh)
+1. Install prerequisites (Flatpak, Bottles, build tools, Vulkan drivers)
+2. Run `./setup.sh` — handles fixes 1–4 automatically
+3. Create the `Fusion360` bottle in Bottles with the settings above
+4. In Bottles → Fusion360 → Settings → Environment Variables, add:
+   - `LD_PRELOAD` → path printed by setup.sh
    - `DXVK_CONFIG_FILE` → `C:\dxvk.conf`
-5. **Enable Virtual Desktop** in Bottles (Fusion360 bottle → Settings → Display)
-6. **Download and run the Fusion 360 installer** from inside the bottle:
-   - In Bottles, click "Run Executable" and select the Fusion 360 installer EXE
-   - Or download `Fusion360installer.exe` from Autodesk and run it via Bottles
-7. **Sign in** — when the Autodesk login browser window opens, complete login normally; the URL handler will route the callback back to Wine
-8. **Open a design** — the 3D viewport should render without crashing
+5. Enable Virtual Desktop in the bottle's display settings
+6. Download the Fusion 360 installer from Autodesk, run it via Bottles → Run Executable
+7. Sign in — complete the browser login normally; the URL handler routes the callback back
+8. Open a design — viewport should render without crashing
 
 ---
 
@@ -259,40 +277,45 @@ Windows: win10
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| "Not enough disk space" on install/launch | fstatfs check failing | Fix 1 (fake_statvfs shim) — check LD_PRELOAD is set in Bottles env vars |
-| App killed ~60–90s after launch, no crash dialog | systemd-oomd OOM kill | Fix 2 — expand swap to 16 GB |
-| Crash on opening/creating a design document | DXVK `VK_EXT_graphics_pipeline_library` bug on Intel ANV | Fix 3 — install dxvk.conf, set DXVK_CONFIG_FILE env var |
-| Login browser opens but app never receives auth token | Missing `adskidmgr://` URL scheme handler | Fix 4 — run setup.sh to register handler |
-| 3D viewport is completely blank, rest of app works | wined3d active instead of DXVK | Do NOT set `d3d11=builtin` in DLL overrides; remove it if present |
-| Virtual desktop window appears but gets no input | Virtual desktop mode not enabled | Enable Virtual Desktop in Bottles display settings |
-| `flatpak run` in handler fails / wrong wineserver | Handler uses `flatpak run com.usebottles.bottles` directly | Ensure handler uses `--command=/app/bin/wine` form |
-| adskidmgr handler can't find AdskIdentityManager.exe | Hash-based path not detected | Install Fusion 360 first, then re-run setup.sh |
+| "Not enough disk space" immediately | fstatfs check failing | Fix 1 — verify LD_PRELOAD is set in bottle env vars |
+| App killed ~60–90s in, no crash dialog | systemd-oomd OOM kill | Fix 2 — expand swap to 16 GB |
+| Crash on opening/creating a document | DXVK `VK_EXT_graphics_pipeline_library` bug on Intel ANV | Fix 3 — dxvk.conf + DXVK_CONFIG_FILE env var |
+| Browser login completes but app never authenticates | Missing `adskidmgr://` handler | Fix 4 — re-run setup.sh |
+| 3D viewport blank, rest of app works | wined3d active instead of DXVK | Remove `d3d11=builtin` from DLL overrides |
+| Virtual desktop window gets no keyboard/mouse input | Virtual desktop not enabled | Enable in Bottles → Display settings |
+| `flatpak run` in handler fails | Handler using wrong invocation | Make sure handler uses `--command=/app/bin/wine` form |
+| Handler can't find AdskIdentityManager.exe | Fusion 360 not installed yet | Install Fusion 360 first, then re-run setup.sh |
 
 ---
 
-## File listing
+## Files
 
-| File | Purpose |
+| File | What it does |
 |---|---|
-| `setup.sh` | Automated setup script — run this first |
-| `fake_statvfs.c` | Source for the disk space shim (Fix 1) |
-| `dxvk.conf` | DXVK pipeline library disable config (Fix 3) |
-| `adskidmgr-handler.sh` | OAuth URL scheme handler script (Fix 4) |
+| `setup.sh` | Main setup script — run this |
+| `fake_statvfs.c` | Source for the LD_PRELOAD disk space shim |
+| `dxvk.conf` | DXVK config that disables the broken pipeline extension |
+| `adskidmgr-handler.sh` | OAuth callback URL handler |
 
 ---
 
 ## Contributing
 
-If you've confirmed this works on different hardware (AMD GPU, Nvidia, different Coffee Lake variants, ARM), please open an issue or PR with your configuration details.
+If this works for you on hardware not listed here — different GPU, distro, RAM config — open an issue or PR with details.
 
-Known untested configurations:
-- AMD GPU with RADV driver
-- Nvidia GPU with proprietary driver
-- Bottles installed as native package (non-Flatpak) — Fix 4 will need path changes
-- X11 session (non-Wayland) — virtual desktop may not be needed
+Tested:
+- Intel Iris Plus 645 (Coffee Lake) — Ubuntu 24.04, Zorin OS 17, Arch Linux — Wayland
+
+Not yet tested:
+- AMD GPU (RADV) — script generates correct pacman command; dxvk.conf probably not needed
+- Nvidia proprietary driver
+- Arch with btrfs root — swap logic is in there but unverified; please report
+- Bottles native package (non-Flatpak) — Fix 4 handler paths will need changes
+- X11 session — virtual desktop may be unnecessary
+- ARM
 
 ---
 
 ## License
 
-MIT — do whatever you want with this. Autodesk Fusion 360 itself is proprietary software subject to Autodesk's terms.
+MIT. Autodesk Fusion 360 is proprietary software and subject to Autodesk's own terms.
